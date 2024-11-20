@@ -38,6 +38,9 @@ This extension is inspired by the research of [James Kettle](https://portswigger
 
 3. **Server Behavior Dependency**:  
    - The effectiveness of race condition testing relies heavily on how the target server processes concurrent requests.
+  
+4. **BApp Store Availability**:
+   - This extension is currently not listed in the BApp Store (although it has been submitted to PortSwigger and is undergoing review). For now, please follow the steps delineated below in **Setup Instructions**.
 
 ---
 
@@ -59,7 +62,15 @@ Use responsibly and ensure compliance with applicable laws and ethical guideline
 
 1. **Download the JAR**:  
    - Visit the [Releases](https://github.com/richeeta/PacketSprinter/releases) section of this repository.
-   - Download the latest `PacketSprinter.jar` file.
+   - Download the latest [PacketSprinter.jar](https://github.com/richeeta/PacketSprinter/releases/download/v1.0.0/PacketSprinter-1.0.0.jar) file:
+   #### Bash
+     ```bash
+     wget https://github.com/richeeta/PacketSprinter/releases/download/v1.0.0/PacketSprinter-1.0.0.jar
+     ```
+   #### PowerShell
+     ```powershell
+     iwr -uri https://github.com/richeeta/PacketSprinter/releases/download/v1.0.0/PacketSprinter-1.0.0.jar -Outfile "PacketSprinter.jar"
+     ```
 
 2. **Install the Extension**:  
    - Open **Burp Suite**.
@@ -88,7 +99,7 @@ Use responsibly and ensure compliance with applicable laws and ethical guideline
    cd PacketSprinter
    ```
 2. **Install Dependencies**:
-   * Place the Montoya API JAR in the libs/ directory of the project.
+   * Place the Montoya API JAR in the `libs/` directory of the project.
 3. **Build the JAR**:
     ```bash
     gradle build
