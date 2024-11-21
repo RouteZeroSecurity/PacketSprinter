@@ -14,15 +14,17 @@ import burp.api.montoya.extension.ExtensionUnloadingHandler;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
+import burp.api.montoya.http.HttpMode;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
-import java.awt.*;
-import java.util.*;
-import java.util.List;
-import java.util.concurrent.*;
+
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.text.*;
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+import java.util.stream.Collectors;
 
 public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, ExtensionUnloadingHandler {
     private MontoyaApi api;
@@ -82,7 +84,111 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
         api.userInterface().registerSuiteTab("PacketSprinter", mainPanel);
     }
 
-    private void initializeUI() {
+private void sendParallelRequests() {
+    if (duplicatedRequests.isEmpty()) {
+        JOptionPane.showMessageDialog(null, "No requests to send.");
+        return;
+    }
+
+    SwingUtilities.invokeLater(() -> {
+        for (JTextPane editor : responseEditors) {
+            editor.setText("Preparing to send request...");
+        }
+    });
+
+    // Run requests in a separate thread
+    new Thread(() -> {
+        try {
+            // Prepare requests with optimized headers for HTTP/2
+            List<HttpRequest> optimizedRequests = duplicatedRequests.stream()
+                .map(request -> request
+                    .withRemovedHeader("Connection") // HTTP/2 handles this implicitly
+                    .withRemovedHeader("Accept-Encoding") // Ensure no compression issues
+                    .withHeader("Accept-Encoding", "identity") // Avoid transformations
+                    .withHeader("Cache-Control", "no-cache") // Ensure fresh content
+                )
+                .toList();
+
+            long startTime = System.nanoTime();
+
+            // Send requests in parallel using HTTP/2 mode
+            List<HttpRequestResponse> results = api.http().sendRequests(optimizedRequests, HttpMode.HTTP_2);
+
+            long endTime = System.nanoTime();
+
+            // Process responses
+            final List<ResponseData> processedResponses = results.stream()
+                .map(result -> processResponse(result, endTime - startTime))
+                .toList();
+
+            // Update UI in EDT
+            SwingUtilities.invokeLater(() -> {
+                responses.clear();
+                responses.addAll(processedResponses);
+
+                for (int i = 0; i < responses.size(); i++) {
+                    updateResponseDisplay(responseEditors[i], responses.get(i), i);
+                }
+
+                logTimingAnalysis(responses);
+            });
+
+        } catch (Exception e) {
+            api.logging().logToError("Error sending parallel requests: " + e.getMessage());
+            SwingUtilities.invokeLater(() -> 
+                JOptionPane.showMessageDialog(null, "Error sending requests: " + e.getMessage())
+            );
+        }
+    }, "PacketSprinter-RequestThread").start();
+}
+
+
+    private ResponseData processResponse(HttpRequestResponse reqRes, long nanoTime) {
+        ResponseData responseData = new ResponseData();
+        responseData.timing = nanoTime / 1_000_000; // Convert to milliseconds
+
+        if (reqRes != null && reqRes.response() != null) {
+            HttpResponse response = reqRes.response();
+            responseData.statusCode = response.statusCode();
+            responseData.bodyLength = response.body().length();
+            responseData.body = response.bodyToString();
+            response.headers().forEach(header -> 
+                responseData.headers.put(header.name(), header.value()));
+            responseData.rawResponse = response.toString();
+        } else {
+            responseData.statusCode = -1;
+            responseData.body = "No response received";
+        }
+
+        return responseData;
+    }
+
+    private void logTimingAnalysis(List<ResponseData> responses) {
+        if (responses.isEmpty()) return;
+
+        StringBuilder analysis = new StringBuilder("\nRequest Analysis:\n");
+        analysis.append(String.format("Total Requests Sent: %d\n", responses.size()));
+        
+        // Analyze status codes
+        Map<Integer, Long> statusCounts = responses.stream()
+            .collect(Collectors.groupingBy(r -> r.statusCode, Collectors.counting()));
+        analysis.append("\nStatus Code Distribution:\n");
+        statusCounts.forEach((code, count) -> 
+            analysis.append(String.format("HTTP %d: %d requests\n", code, count)));
+
+        // Analyze response lengths
+        DoubleSummaryStatistics lengthStats = responses.stream()
+            .mapToDouble(r -> r.bodyLength)
+            .summaryStatistics();
+        analysis.append(String.format("\nResponse Length Analysis:\n"));
+        analysis.append(String.format("Min: %d bytes\n", (long)lengthStats.getMin()));
+        analysis.append(String.format("Max: %d bytes\n", (long)lengthStats.getMax()));
+        analysis.append(String.format("Average: %.2f bytes\n", lengthStats.getAverage()));
+
+        api.logging().logToOutput(analysis.toString());
+    }
+
+private void initializeUI() {
         mainPanel = new JPanel(new BorderLayout(PANEL_SPACING, PANEL_SPACING));
         mainPanel.setBorder(new EmptyBorder(PANEL_SPACING, PANEL_SPACING, PANEL_SPACING, PANEL_SPACING));
 
@@ -102,6 +208,7 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
         splitPane.setLeftComponent(requestScrollPane);
         splitPane.setRightComponent(responseScrollPane);
 
+        // Control Panel
         JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         
         httpVersionCombo = new JComboBox<>(new String[]{HTTP2});
@@ -121,7 +228,8 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
                 duplicateRequest();
             }
         });
-        sendButton.addActionListener(e -> sendRequestsInParallel());
+        
+        sendButton.addActionListener(e -> sendParallelRequests());
         clearButton.addActionListener(e -> clearRequests());
 
         controlPanel.add(versionLabel);
@@ -148,6 +256,7 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
         responseEditors = new JTextPane[duplicatedRequests.size()];
 
         for (int i = 0; i < duplicatedRequests.size(); i++) {
+            // Request Panel
             JPanel singleRequestPanel = new JPanel(new BorderLayout());
             singleRequestPanel.setBorder(BorderFactory.createTitledBorder("Request " + (i + 1)));
             
@@ -163,6 +272,7 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
             JScrollPane requestScroll = new JScrollPane(requestEditor);
             singleRequestPanel.add(requestScroll);
 
+            // Response Panel
             JPanel singleResponsePanel = new JPanel(new BorderLayout());
             singleResponsePanel.setBorder(BorderFactory.createTitledBorder("Response " + (i + 1)));
             singleResponsePanel.setMinimumSize(panelSize);
@@ -192,137 +302,6 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
         mainPanel.repaint();
     }
 
-    @Override
-    public List<Component> provideMenuItems(ContextMenuEvent event) {
-        List<Component> menuItems = new ArrayList<>();
-        if (event.isFromTool(ToolType.PROXY) || event.isFromTool(ToolType.REPEATER)) {
-            JMenuItem menuItem = new JMenuItem("PacketSprinter: Send Requests in Parallel");
-            menuItem.addActionListener(e -> handleRequest(event));
-            menuItems.add(menuItem);
-        }
-        return menuItems;
-    }
-
-    private void handleRequest(ContextMenuEvent event) {
-        List<HttpRequestResponse> selectedRequests = event.selectedRequestResponses();
-        if (selectedRequests != null && !selectedRequests.isEmpty()) {
-            HttpRequest baseRequest = selectedRequests.get(0).request();
-            duplicatedRequests.clear();
-            responses.clear();
-            duplicatedRequests.add(baseRequest);
-            responses.add(new ResponseData());
-            updateUI();
-            JOptionPane.showMessageDialog(null, "Request loaded. Go to the 'PacketSprinter' tab.");
-        }
-    }
-
-    private void duplicateRequest() {
-        if (!duplicatedRequests.isEmpty()) {
-            HttpRequest lastRequest = duplicatedRequests.get(duplicatedRequests.size() - 1);
-            duplicatedRequests.add(HttpRequest.httpRequest(
-                lastRequest.httpService(),
-                lastRequest.toByteArray()
-            ));
-            responses.add(new ResponseData());
-            updateUI();
-        } else {
-            JOptionPane.showMessageDialog(null, "No base request loaded to duplicate.");
-        }
-    }
-
-    private void sendRequestsInParallel() {
-        if (duplicatedRequests.isEmpty()) {
-            JOptionPane.showMessageDialog(null, "No requests to send.");
-            return;
-        }
-
-        SwingUtilities.invokeLater(() -> {
-            for (JTextPane editor : responseEditors) {
-                editor.setText("Preparing to send request...");
-            }
-        });
-
-        try {
-            sendHttp2Requests();
-        } catch (Exception e) {
-            api.logging().logToError("Error sending requests: " + e.getMessage());
-            JOptionPane.showMessageDialog(null, "Error sending requests: " + e.getMessage());
-        }
-    }
-
-    private void sendHttp2Requests() {
-        int threadCount = duplicatedRequests.size();
-        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
-        CyclicBarrier barrier = new CyclicBarrier(threadCount);
-        List<Future<ResponseData>> futures = new ArrayList<>();
-
-        long startTime = System.nanoTime();
-
-        for (int i = 0; i < threadCount; i++) {
-            final int index = i;
-            Future<ResponseData> future = executor.submit(() -> {
-                try {
-                    barrier.await(10, TimeUnit.SECONDS);
-                    HttpRequestResponse reqRes = api.http().sendRequest(duplicatedRequests.get(index));
-                    return processResponse(reqRes, System.nanoTime() - startTime);
-                } catch (Exception e) {
-                    return createErrorResponse(e);
-                }
-            });
-            futures.add(future);
-        }
-
-        processResponses(futures);
-        executor.shutdown();
-    }
-
-    private void processResponses(List<Future<ResponseData>> futures) {
-        responses.clear();
-        
-        for (int i = 0; i < futures.size(); i++) {
-            try {
-                ResponseData response = futures.get(i).get(30, TimeUnit.SECONDS);
-                responses.add(response);
-                
-                final int index = i;
-                SwingUtilities.invokeLater(() -> 
-                    updateResponseDisplay(responseEditors[index], response, index));
-                
-            } catch (Exception e) {
-                responses.add(createErrorResponse(e));
-            }
-        }
-    }
-
-    private ResponseData processResponse(HttpRequestResponse reqRes, long nanoTime) {
-        ResponseData responseData = new ResponseData();
-        responseData.timing = nanoTime / 1_000_000; 
-
-        if (reqRes != null && reqRes.response() != null) {
-            HttpResponse response = reqRes.response();
-            responseData.statusCode = response.statusCode();
-            responseData.bodyLength = response.body().length();
-            responseData.body = response.bodyToString();
-            response.headers().forEach(header -> 
-                responseData.headers.put(header.name(), header.value()));
-        } else {
-            responseData.statusCode = -1;
-            responseData.body = "No response received";
-        }
-
-        return responseData;
-    }
-
-    private ResponseData createErrorResponse(Exception e) {
-        ResponseData errorResponse = new ResponseData();
-        errorResponse.statusCode = -1;
-        errorResponse.body = "Error: " + e.getMessage();
-        if (e.getStackTrace().length > 0) {
-            errorResponse.body += "\n" + e.getStackTrace()[0].toString();
-        }
-        return errorResponse;
-    }
-
     private void updateResponseDisplay(JTextPane editor, ResponseData response, int index) {
         StyledDocument doc = editor.getStyledDocument();
         try {
@@ -337,7 +316,6 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
             String lengthText = "Body Length: " + response.bodyLength + "\n";
             insertText(doc, lengthText,
                 shouldHighlight("length", index) ? HIGHLIGHT_STYLE : NORMAL_STYLE);
-            
 
             if (!response.headers.isEmpty()) {
                 insertText(doc, "\nHeaders:\n", HEADER_STYLE);
@@ -369,35 +347,80 @@ public class BurpExtender implements BurpExtension, ContextMenuItemsProvider, Ex
         ResponseData baseResponse = responses.get(0);
         ResponseData currentResponse = responses.get(index);
         
-        switch (component) {
-            case "status":
-                return baseResponse.statusCode != currentResponse.statusCode;
-            case "length":
-                return baseResponse.bodyLength != currentResponse.bodyLength;
-            case "body":
-                return !Objects.equals(baseResponse.body, currentResponse.body);
-            default:
+        return switch (component) {
+            case "status" -> baseResponse.statusCode != currentResponse.statusCode;
+            case "length" -> baseResponse.bodyLength != currentResponse.bodyLength;
+            case "body" -> !Objects.equals(baseResponse.body, currentResponse.body);
+            default -> {
                 if (component.startsWith("header:")) {
                     String headerName = component.substring(7);
                     String baseValue = baseResponse.headers.get(headerName);
                     String currentValue = currentResponse.headers.get(headerName);
-                    return !Objects.equals(baseValue, currentValue);
+                    yield !Objects.equals(baseValue, currentValue);
                 }
-                return false;
+                yield false;
+            }
+        };
+    }
+
+    @Override
+    public List<Component> provideMenuItems(ContextMenuEvent event) {
+        List<Component> menuItems = new ArrayList<>();
+        if (event.isFromTool(ToolType.PROXY) || event.isFromTool(ToolType.REPEATER)) {
+            JMenuItem menuItem = new JMenuItem("Send Requests in Single Packet");
+            menuItem.addActionListener(e -> handleRequest(event));
+            menuItems.add(menuItem);
+        }
+        return menuItems;
+    }
+
+    private void handleRequest(ContextMenuEvent event) {
+        List<HttpRequestResponse> selectedRequests = event.selectedRequestResponses();
+        if (selectedRequests != null && !selectedRequests.isEmpty()) {
+            HttpRequest baseRequest = selectedRequests.get(0).request();
+            
+            // Update collections in EDT
+            SwingUtilities.invokeLater(() -> {
+                duplicatedRequests.clear();
+                responses.clear();
+                duplicatedRequests.add(baseRequest);
+                responses.add(new ResponseData());
+                updateUI();
+                JOptionPane.showMessageDialog(null, "Request loaded. Go to the 'PacketSprinter' tab.");
+            });
+        }
+    }
+
+    private void duplicateRequest() {
+        if (!duplicatedRequests.isEmpty()) {
+            HttpRequest lastRequest = duplicatedRequests.get(duplicatedRequests.size() - 1);
+            
+            // Update collections in EDT
+            SwingUtilities.invokeLater(() -> {
+                duplicatedRequests.add(HttpRequest.httpRequest(
+                    lastRequest.httpService(),
+                    lastRequest.toByteArray()
+                ));
+                responses.add(new ResponseData());
+                updateUI();
+            });
+        } else {
+            SwingUtilities.invokeLater(() -> 
+                JOptionPane.showMessageDialog(null, "No base request loaded to duplicate.")
+            );
         }
     }
 
     private void clearRequests() {
-        duplicatedRequests.clear();
-        responses.clear();
-        updateUI();
+        SwingUtilities.invokeLater(() -> {
+            duplicatedRequests.clear();
+            responses.clear();
+            updateUI();
+        });
     }
 
     @Override
     public void extensionUnloaded() {
-        if (!duplicatedRequests.isEmpty()) {
-            duplicatedRequests.clear();
-            responses.clear();
-        }
+        clearRequests();
     }
 }
